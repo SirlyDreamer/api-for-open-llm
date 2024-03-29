@@ -216,6 +216,34 @@ class QwenTemplate(BaseTemplate):
         return output, None
 
 
+class Qwen2Template(BaseTemplate):
+
+    name = "qwen2"
+    allow_models = ["qwen2"]
+    stop = {
+        "strings": ["<|endoftext|>", "<|im_end|>"],
+    }
+
+    @property
+    def template(self) -> str:
+        """ This template formats inputs in the standard ChatML format. See
+        https://github.com/openai/openai-python/blob/main/chatml.md
+        """
+        return (
+            "{% for message in messages %}"
+            "{% if loop.first and messages[0]['role'] != 'system' %}"
+            "{{ '<|im_start|>system\nYou are a helpful assistant<|im_end|>\n' }}"
+            "{% endif %}"
+            "{{'<|im_start|>' + message['role'] + '\n' + message['content']}}"
+            "{% if (loop.last and add_generation_prompt) or not loop.last %}"
+            "{{ '<|im_end|>' + '\n'}}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt and messages[-1]['role'] != 'assistant' %}"
+            "{{ '<|im_start|>assistant\n' }}{% endif %}"
+        )
+
+
 class Llama2Template(BaseTemplate):
 
     name = "llama2"
@@ -1354,6 +1382,7 @@ register_prompt_adapter(PhindTemplate)
 register_prompt_adapter(PhoenixTemplate)
 
 register_prompt_adapter(QwenTemplate)
+register_prompt_adapter(Qwen2Template)
 
 register_prompt_adapter(StarChatTemplate)
 register_prompt_adapter(SusChatTemplate)
@@ -1376,6 +1405,6 @@ if __name__ == '__main__':
         {"role": "assistant", "content": "I'm doing great. How can I help you today?"},
         {"role": "user", "content": "I'd like to show off how chat templating works!"},
     ]
-    template = get_prompt_adapter(prompt_name="internlm2")
+    template = get_prompt_adapter(prompt_name="qwen2")
     messages = template.postprocess_messages(chat)
     print(template.apply_chat_template(messages))
