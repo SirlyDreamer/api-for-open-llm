@@ -2,17 +2,23 @@ from functools import partial
 from typing import Iterator
 
 import anyio
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import (
+    APIRouter,
+    Depends,
+    Request,
+    HTTPException,
+    status,
+)
 from loguru import logger
 from sse_starlette import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
 
-from api.core.default import DefaultEngine
-from api.models import GENERATE_ENGINE
-from api.utils.compat import model_dump
-from api.utils.protocol import CompletionCreateParams
-from api.utils.request import (
-    handle_request,
+from api.common import dictify
+from api.engine.hf import HuggingFaceEngine
+from api.models import LLM_ENGINE
+from api.protocol import CompletionCreateParams
+from api.utils import (
+    check_completion_requests,
     check_api_key,
     get_event_publisher,
 )
@@ -21,14 +27,18 @@ completion_router = APIRouter()
 
 
 def get_engine():
-    yield GENERATE_ENGINE
+    yield LLM_ENGINE
 
 
-@completion_router.post("/completions", dependencies=[Depends(check_api_key)])
+@completion_router.post(
+    "/completions",
+    dependencies=[Depends(check_api_key)],
+    status_code=status.HTTP_200_OK,
+)
 async def create_completion(
     request: CompletionCreateParams,
     raw_request: Request,
-    engine: DefaultEngine = Depends(get_engine),
+    engine: HuggingFaceEngine = Depends(get_engine),
 ):
     if isinstance(request.prompt, str):
         request.prompt = [request.prompt]
@@ -36,10 +46,15 @@ async def create_completion(
     if len(request.prompt) < 1:
         raise HTTPException(status_code=400, detail="Invalid request")
 
-    request = await handle_request(request, engine.stop, chat=False)
+    request = await check_completion_requests(
+        request,
+        engine.template.stop,
+        engine.template.stop_token_ids,
+        chat=False,
+    )
     request.max_tokens = request.max_tokens or 128
 
-    params = model_dump(request, exclude={"prompt"})
+    params = dictify(request, exclude={"prompt"})
     params.update(dict(prompt_or_messages=request.prompt[0]))
     logger.debug(f"==== request ====\n{params}")
 

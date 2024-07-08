@@ -2,17 +2,23 @@ from functools import partial
 from typing import Iterator
 
 import anyio
-from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi import (
+    APIRouter,
+    Depends,
+    Request,
+    HTTPException,
+    status,
+)
 from loguru import logger
 from sse_starlette import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
 
-from api.core.default import DefaultEngine
-from api.models import GENERATE_ENGINE
-from api.utils.compat import model_dump
-from api.utils.protocol import ChatCompletionCreateParams, Role
-from api.utils.request import (
-    handle_request,
+from api.common import dictify
+from api.engine.hf import HuggingFaceEngine
+from api.models import LLM_ENGINE
+from api.protocol import ChatCompletionCreateParams, Role
+from api.utils import (
+    check_completion_requests,
     check_api_key,
     get_event_publisher,
 )
@@ -21,23 +27,31 @@ chat_router = APIRouter(prefix="/chat")
 
 
 def get_engine():
-    yield GENERATE_ENGINE
+    yield LLM_ENGINE
 
 
-@chat_router.post("/completions", dependencies=[Depends(check_api_key)])
+@chat_router.post(
+    "/completions",
+    dependencies=[Depends(check_api_key)],
+    status_code=status.HTTP_200_OK,
+)
 async def create_chat_completion(
     request: ChatCompletionCreateParams,
     raw_request: Request,
-    engine: DefaultEngine = Depends(get_engine),
+    engine: HuggingFaceEngine = Depends(get_engine),
 ):
     """Creates a completion for the chat message"""
-    if (not request.messages) or request.messages[-1]["role"] == Role.ASSISTANT:
+    if (not request.messages) or request.messages[-1]["role"] == Role.ASSISTANT.value:
         raise HTTPException(status_code=400, detail="Invalid request")
 
-    request = await handle_request(request, engine.stop)
+    request = await check_completion_requests(
+        request,
+        engine.template.stop,
+        engine.template.stop_token_ids,
+    )
     request.max_tokens = request.max_tokens or 1024
 
-    params = model_dump(request, exclude={"messages"})
+    params = dictify(request, exclude={"messages"})
     params.update(dict(prompt_or_messages=request.messages, echo=False))
     logger.debug(f"==== request ====\n{params}")
 

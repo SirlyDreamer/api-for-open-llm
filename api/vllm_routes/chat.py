@@ -5,7 +5,8 @@ from functools import partial
 from typing import AsyncIterator
 
 import anyio
-from fastapi import APIRouter, Depends
+import vllm
+from fastapi import APIRouter, Depends, status
 from fastapi import HTTPException, Request
 from loguru import logger
 from openai.types.chat import (
@@ -24,56 +25,61 @@ from openai.types.chat.chat_completion_message import FunctionCall
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 from openai.types.completion_usage import CompletionUsage
 from sse_starlette import EventSourceResponse
-from vllm.model_executor.guided_decoding import get_guided_decoding_logits_processor
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 
-from api.core.vllm_engine import VllmEngine
-from api.models import GENERATE_ENGINE
-from api.utils.compat import model_dump, model_parse
-from api.utils.protocol import Role, ChatCompletionCreateParams
-from api.utils.request import (
+from api.common import dictify, model_validate
+from api.engine.vllm_engine import VllmEngine
+from api.models import LLM_ENGINE
+from api.protocol import Role, ChatCompletionCreateParams
+from api.utils import (
     check_api_key,
-    handle_request,
+    check_completion_requests,
     get_event_publisher,
 )
 
 chat_router = APIRouter(prefix="/chat")
+vllm_version = vllm.__version__
 
 
 def get_engine():
-    yield GENERATE_ENGINE
+    yield LLM_ENGINE
 
 
-@chat_router.post("/completions", dependencies=[Depends(check_api_key)])
+@chat_router.post(
+    "/completions",
+    dependencies=[Depends(check_api_key)],
+    status_code=status.HTTP_200_OK,
+)
 async def create_chat_completion(
     request: ChatCompletionCreateParams,
     raw_request: Request,
     engine: VllmEngine = Depends(get_engine),
 ):
-    if (not request.messages) or request.messages[-1]["role"] == Role.ASSISTANT:
+    if (not request.messages) or request.messages[-1]["role"] == Role.ASSISTANT.value:
         raise HTTPException(status_code=400, detail="Invalid request")
 
-    request = await handle_request(request, engine.prompt_adapter.stop)
+    request = await check_completion_requests(
+        request,
+        engine.template.stop,
+        engine.template.stop_token_ids,
+    )
     request.max_tokens = request.max_tokens or 512
 
-    params = model_dump(request, exclude={"messages"})
+    if request.best_of < request.n:
+        request.best_of = request.n
+
+    params = dictify(request, exclude={"messages"})
     params.update(dict(prompt_or_messages=request.messages, echo=False))
     logger.debug(f"==== request ====\n{params}")
 
     request_id: str = f"chatcmpl-{str(uuid.uuid4())}"
-    prompt = engine.apply_chat_template(
-        request.messages,
-        functions=request.functions,
+    token_ids = engine.template.convert_messages_to_ids(
+        messages=request.messages,
         tools=request.tools,
+        max_tokens=request.max_tokens,
     )
 
-    if isinstance(prompt, list):
-        prompt, token_ids = None, prompt
-    else:
-        prompt, token_ids = prompt, None
-
-    token_ids = engine.convert_to_inputs(prompt, token_ids, max_tokens=request.max_tokens)
     result_generator = None
     try:
         include = {
@@ -90,31 +96,60 @@ async def create_chat_completion(
             "skip_special_tokens",
             "spaces_between_special_tokens",
         }
-        kwargs = model_dump(request, include=include)
+        kwargs = dictify(request, include=include)
         sampling_params = SamplingParams(
             stop=request.stop or [],
             stop_token_ids=request.stop_token_ids or [],
             max_tokens=request.max_tokens,
             **kwargs,
         )
-        lora_request = engine._maybe_get_lora(request.model)
-        guided_decode_logits_processor = (
-            await get_guided_decoding_logits_processor(
-                request,
-                engine.tokenizer,
-            )
-        )
-        if guided_decode_logits_processor:
-            sampling_params.logits_processors = sampling_params.logits_processors or []
-            sampling_params.logits_processors.append(guided_decode_logits_processor)
 
-        result_generator = engine.model.generate(
-            prompt if isinstance(prompt, str) else None,
-            sampling_params,
-            request_id,
-            token_ids,
-            lora_request,
-        )
+        # Todo: support for lora
+        lora_request = None
+        try:
+            from vllm.model_executor.guided_decoding import get_guided_decoding_logits_processor
+
+            if vllm_version >= "0.4.2":
+                decoding_config = await engine.model.get_decoding_config()
+                guided_decode_logits_processor = (
+                    await get_guided_decoding_logits_processor(
+                        request.guided_decoding_backend or decoding_config.guided_decoding_backend,
+                        request,
+                        engine.tokenizer,
+                    )
+                )
+            else:
+                guided_decode_logits_processor = (
+                    await get_guided_decoding_logits_processor(
+                        request,
+                        engine.tokenizer,
+                    )
+                )
+            if guided_decode_logits_processor:
+                sampling_params.logits_processors = sampling_params.logits_processors or []
+                sampling_params.logits_processors.append(guided_decode_logits_processor)
+        except ImportError:
+            pass
+
+        if vllm_version >= "0.4.3":
+            result_generator = engine.model.generate(
+                {
+                    "prompt": None,
+                    "prompt_token_ids": token_ids,
+                },
+                sampling_params,
+                request_id,
+                lora_request,
+            )
+        else:
+            result_generator = engine.model.generate(
+                None,
+                sampling_params,
+                request_id,
+                token_ids,
+                lora_request,
+            )
+
     except ValueError as e:
         traceback.print_exc()
 
@@ -148,8 +183,8 @@ async def create_chat_completion(
             function_call = None
             if request.functions or request.tools:
                 try:
-                    res, function_call = engine.prompt_adapter.parse_assistant_response(
-                        output.text, request.functions, request.tools,
+                    res, function_call = engine.template.parse_assistant_response(
+                        output.text, request.tools or request.functions,
                     )
                     output.text = res
                 except Exception as e:
@@ -166,14 +201,14 @@ async def create_chat_completion(
                 finish_reason = "function_call"
             elif isinstance(function_call, dict) and "function" in function_call:
                 finish_reason = "tool_calls"
-                tool_calls = [model_parse(ChatCompletionMessageToolCall, function_call)]
+                tool_calls = [model_validate(ChatCompletionMessageToolCall, function_call)]
                 message = ChatCompletionMessage(
                     role="assistant",
                     content=output.text,
                     tool_calls=tool_calls,
                 )
             else:
-                message = ChatCompletionMessage(role="assistant", content=output.text)
+                message = ChatCompletionMessage(role="assistant", content=output.text.strip())
 
             choices.append(
                 Choice(
@@ -242,8 +277,8 @@ async def create_chat_completion_stream(
                 elif request.functions or request.tools:
                     call_info = None
                     try:
-                        res, call_info = engine.prompt_adapter.parse_assistant_response(
-                            output.text, request.functions, request.tools,
+                        res, call_info = engine.template.parse_assistant_response(
+                            output.text, request.tools or request.functions,
                         )
                     except Exception as e:
                         traceback.print_exc()
@@ -260,7 +295,7 @@ async def create_chat_completion_stream(
                     elif isinstance(call_info, dict) and "function" in call_info:
                         finish_reason = "tool_calls"
                         call_info["index"] = 0
-                        tool_calls = [model_parse(ChoiceDeltaToolCall, call_info)]
+                        tool_calls = [model_validate(ChoiceDeltaToolCall, call_info)]
                         delta = ChoiceDelta(
                             role="assistant",
                             content=delta_text,
@@ -269,7 +304,7 @@ async def create_chat_completion_stream(
                 
                 choice = ChunkChoice(
                     index=i,
-                    delta=delta or ChoiceDelta(),
+                    delta=delta or ChoiceDelta(content=delta_text),
                     finish_reason=finish_reason,
                     logprobs=None,
                 )
